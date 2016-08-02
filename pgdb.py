@@ -19,67 +19,83 @@ class Debugger:
         except Exception, e:
             print 'failed'
             raise e
-        self.cur.execute('SELECT * FROM pldbg_create_listener();')
-        self.session_id = self.cur.fetchone()[0]
-        print 'session id:', self.session_id
-        # self.cur.execute('SELECT pldbg_set_global_breakpoint(%s, \'test\'::regproc::oid, NULL, NULL);',
-        #                 (self.session_id, ))
+
+        with self.con.cursor() as cursor:
+            cursor.execute('SELECT * FROM pldbg_create_listener();')
+            self.session_id = cursor.fetchone()[0]
+            print 'session id:', self.session_id
 
     def close(self):
-        self.cur.close()
         self.con.close()
 
-    def _get_func_line(self, func_oid, line_no):
-        self.cur.execute('SELECT * FROM pldbg_get_source(%s, %s);',
+    def get_func_line(self, cursor, func_oid, line_no):
+        cursor.execute('SELECT * FROM pldbg_get_source(%s, %s);',
                          (self.session_id, self.func_oid))
-        func_body = self.cur.fetchone()[0]
+        func_body = cursor.fetchone()[0]
         return func_body.split('\n')[line_no-2]
 
-    def _print_current_breakpoint(self):
-        self.func_oid, self.line_no, self.func_name = self.cur.fetchone()
-        print self.line_no, ':', self._get_func_line(self.func_oid, self.line_no)
+    def read_breakpoint(self, cursor):
+        self.func_oid, self.line_no, self.func_name = cursor.fetchone()
+        print '%s : %s' % (
+            self.line_no,
+            self.get_func_line(cursor, self.func_oid, self.line_no))
 
     def run(self):
-        self.cur.execute('SELECT * FROM pldbg_wait_for_target(%s);', (self.session_id, ))
-        self.cur.execute('SELECT * FROM pldbg_wait_for_breakpoint(%s);', (self.session_id, ))
-        self._print_current_breakpoint()
+        with self.con.cursor() as cur:
+            cur.execute('SELECT * FROM pldbg_wait_for_target(%s);', (self.session_id, ))
+            cur.execute('SELECT * FROM pldbg_wait_for_breakpoint(%s);', (self.session_id, ))
+            self.read_breakpoint(cur)
 
     def next(self):
         ''' Do next '''
-        self.cur.execute('SELECT * FROM pldbg_step_over(%s);', (self.session_id, ))
-        self._print_current_breakpoint()
+        with self.con.cursor() as cur:
+            cur.execute('SELECT * FROM pldbg_step_over(%s);', (self.session_id, ))
+            self.read_breakpoint(cur)
 
     def step_into(self):
         ''' Step into '''
-        self.cur.execute('SELECT * FROM pldbg_step_into(%s);', (self.session_id, ))
-        self._print_current_breakpoint()
+        with self.con.cursor() as cur:
+            cur.execute('SELECT * FROM pldbg_step_into(%s);', (self.session_id, ))
+            self.read_breakpoint(cur)
 
     def continue_execution(self):
         ''' Continue execution until the next breakpoint or end of function '''
-        self.cur.execute('SELECT * FROM pldbg_continue(%s);', (self.session_id, ))
-        self._print_current_breakpoint()
+        with self.con.cursor() as cur:
+            cur.execute('SELECT * FROM pldbg_continue(%s);', (self.session_id, ))
+            self.read_breakpoint(cur)
 
     def print_variable(self, var_name):
         ''' Print variable value '''
-        self.cur.execute('SELECT name, value FROM pldbg_get_variables(%s) WHERE name=%s;',
-                         (self.session_id, var_name))
-        for rec in self.cur.fetchall():
-            print rec[0], '=', rec[1]
+        with self.con.cursor() as cur:
+            cur.execute('SELECT name, value FROM pldbg_get_variables(%s) WHERE name=%s;',
+                             (self.session_id, var_name))
+            for rec in cur.fetchall():
+                print rec[0], '=', rec[1]
 
     def set_breakpoint(self, arg):
         # TODO: check if breakpoint is already exists
-        self.cur.execute('SELECT pldbg_set_global_breakpoint(%s, %s::regproc::oid, NULL, NULL);',
-                         (self.session_id, arg))
+        with self.con.cursor() as cur:
+            cur.execute('SELECT pldbg_set_global_breakpoint(%s, %s::regproc::oid, NULL, NULL);',
+                             (self.session_id, arg))
 
     def print_listing(self):
         ''' Prints function body '''
-        self.cur.execute('SELECT * FROM pldbg_get_source(%s, %s);', (self.session_id, self.func_oid))
-        func_body = self.cur.fetchone()[0]
-        for ln, line_text in enumerate(func_body.split('\n'), 1):
-          print ln, '\t', line_text
+        with self.con.cursor() as cur:
+            cur.execute('SELECT * FROM pldbg_get_source(%s, %s);', (self.session_id, self.func_oid))
+            func_body = cur.fetchone()[0]
+            for ln, line_text in enumerate(func_body.split('\n'), 1):
+              print ln, '\t', line_text
+
+    def info(self, arg):
+        arg = arg.strip().lower()
+        with self.con.cursor() as cur:
+            if arg in ('b', 'breakpoint'):
+                cur.execute('SELECT func::regproc, linenumber FROM pldbg_get_breakpoints(1);')
+                for rec in cur:
+                    print '%s: %s' % rec
 
     def handle_command(self, cmd, arg):
-        cmd = cmd.lower()
+        cmd = cmd.strip().lower()
         if cmd in ('r', 'run'):
             self.run()
         if cmd in ('n', 'next'):
@@ -93,10 +109,7 @@ class Debugger:
         elif cmd in ('b', 'breakpoint'):
             self.set_breakpoint(arg)
         elif cmd in ('i', 'info'):
-            if arg in ('b', 'breakpoint'):
-                self.cur.execute('SELECT func::regproc, linenumber FROM pldbg_get_breakpoints(1);')
-                for rec in self.cur:
-                    print rec[0], ':', rec[1]
+            self.info(arg)
         elif cmd in ('l', 'list'):
             self.print_listing()
 
@@ -117,13 +130,11 @@ def main(db, user, func):
             last_cmd = raw_cmd
 
         # get argument
-        pos = raw_cmd.find(' ')
-        if pos > 0:
-            cmd = raw_cmd[0:pos]
-            arg = raw_cmd[pos:].strip()
+        parts = raw_cmd.split(' ', 1)
+        if len(parts) > 1:
+            cmd, arg = parts
         else:
-            cmd = raw_cmd
-            arg = None
+            cmd, arg = raw_cmd, None
         dbg.handle_command(cmd, arg)
 
     dbgr.close()
